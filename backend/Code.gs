@@ -68,15 +68,21 @@ var DEFAULTS = {
   alert_readings_in_a_row: 3,
   alert_email:             "gpreccems@gmail.com",
   tariff_per_kwh:          7,
-  co2_kg_per_kwh:          0.7
+  co2_kg_per_kwh:          0.7,
+  ingest_key:              ""   // set this in Solar_Settings — must match INGEST_KEY in firmware
 };
 
 var SETTINGS_SHEET = "Solar_Settings";
 var CACHE_TTL = { BUNDLE: 15, OTHER: 60 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-// SECTION 1 — YOUR ORIGINAL doPost (UNCHANGED)
-// The MODBUS logger continues to work exactly as before.
+// SECTION 1 — doPost  (two formats supported)
+//
+//  A) ESP32 firmware format  {key, rows:[{timestamp,power_kw,ac_voltage,frequency_hz}]}
+//     → validates ingest_key, writes to YYYY-MM-DD daily tab, returns {saved:N}
+//
+//  B) Legacy MODBUS format   {sheet, keys:[], values:{}}
+//     → unchanged behaviour, returns {status:"success"}
 // ═══════════════════════════════════════════════════════════════════════════
 
 function doPost(e) {
@@ -84,61 +90,126 @@ function doPost(e) {
     if (!e || !e.postData || !e.postData.contents) {
       throw new Error("No POST payload received.");
     }
-    var jsonString = e.postData.contents;
-    var data = JSON.parse(jsonString);
-    var targetSheetName = data.sheet || "Daily_Log_Default";
-    var keys = data.keys || [];
-    var valuesObject = data.values || {};
+    var data = JSON.parse(e.postData.contents);
 
-    var targetSpreadsheet = SpreadsheetApp.openById(SPREADSHEET_ID);
-
-    // Auto-archive if approaching 8M cells
-    var totalCells = getTotalWorkbookCells(targetSpreadsheet);
-    if (totalCells >= 8000000) {
-      emailAndResetSpreadsheet(targetSpreadsheet, DEFAULTS.alert_email);
+    // ── Route A: firmware batch ingest {key, rows} ──────────────────────────
+    if (data.key !== undefined && Array.isArray(data.rows)) {
+      return doPostFirmware(data);
     }
 
-    var sheet = targetSpreadsheet.getSheetByName(targetSheetName);
-    if (!sheet) {
-      sheet = targetSpreadsheet.insertSheet(targetSheetName);
-      var defaultSheet = targetSpreadsheet.getSheetByName("Sheet1");
-      if (defaultSheet && targetSpreadsheet.getSheets().length > 1) {
-        targetSpreadsheet.deleteSheet(defaultSheet);
-      }
-      if (keys.length > 0) {
-        sheet.appendRow(keys);
-      }
-      SpreadsheetApp.flush();
-    }
-
-    var rowData = [];
-    for (var i = 0; i < keys.length; i++) {
-      var val = valuesObject[keys[i]];
-      rowData.push((val === null || val === "None" || val === undefined) ? "" : val);
-    }
-    if (rowData.length > 0) {
-      sheet.appendRow(rowData);
-    }
-
-    // Clear dashboard cache for today so fresh data appears immediately
-    try {
-      var cache = CacheService.getScriptCache();
-      var todayStr = Utilities.formatDate(new Date(), "Asia/Kolkata", "yyyy-MM-dd");
-      cache.remove("bundle_" + todayStr);
-      cache.remove("bundle_");
-    } catch(ex) { /* ignore cache errors */ }
-
-    return ContentService.createTextOutput(JSON.stringify({
-      "status": "success",
-      "message": "Data logged into tab → " + targetSheetName
-    })).setMimeType(ContentService.MimeType.JSON);
+    // ── Route B: legacy MODBUS logger {sheet, keys, values} ─────────────────
+    return doPostModbus(data);
 
   } catch (error) {
     return ContentService.createTextOutput(JSON.stringify({
-      "status": "error",
-      "message": error.toString()
+      "status": "error", "message": error.toString()
     })).setMimeType(ContentService.MimeType.JSON);
   }
+}
+
+// ─── Route A: ESP32 firmware ingest ─────────────────────────────────────────
+function doPostFirmware(data) {
+  // Validate key
+  var cfg = loadSettings();
+  var expectedKey = cfg.ingest_key || "";
+  if (!expectedKey || data.key !== expectedKey) {
+    return ContentService.createTextOutput(
+      JSON.stringify({ "error": "Unauthorized" })
+    ).setMimeType(ContentService.MimeType.JSON);
+  }
+
+  var ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+  var saved = 0;
+  var HEADERS = ["Timestamp","Active_Power_kW","Energy_Today_kWh",
+                 "DC_Voltage_V","DC_Current_A","AC_Voltage_V",
+                 "Frequency_Hz","Inverter_Temp_C"];
+
+  (data.rows || []).forEach(function(row) {
+    var ts = String(row.timestamp || "").trim();
+    if (!ts) return;
+
+    // Accept "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DD HH:MM" or ISO
+    var dateStr = ts.substring(0, 10);  // "YYYY-MM-DD" → tab name
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) return;
+
+    var sheet = ss.getSheetByName(dateStr);
+    if (!sheet) {
+      sheet = ss.insertSheet(dateStr);
+      sheet.appendRow(HEADERS);
+      SpreadsheetApp.flush();
+    }
+
+    var pw  = parseFloat(row.power_kw);
+    var acV = parseFloat(row.ac_voltage);
+    var hz  = parseFloat(row.frequency_hz);
+
+    sheet.appendRow([
+      ts,
+      isNaN(pw)  ? "" : pw,
+      "",           // Energy_Today_kWh (not from firmware)
+      "",           // DC_Voltage_V
+      "",           // DC_Current_A
+      isNaN(acV) ? "" : acV,
+      isNaN(hz)  ? "" : hz,
+      ""            // Inverter_Temp_C
+    ]);
+    saved++;
+  });
+
+  // Clear bundle cache so dashboard shows fresh data
+  try {
+    var cache = CacheService.getScriptCache();
+    var today = Utilities.formatDate(new Date(), "Asia/Kolkata", "yyyy-MM-dd");
+    cache.remove("bundle_" + today);
+    cache.remove("months_all");
+  } catch(ex) {}
+
+  return ContentService.createTextOutput(
+    JSON.stringify({ "status": "success", "saved": saved })
+  ).setMimeType(ContentService.MimeType.JSON);
+}
+
+// ─── Route B: legacy MODBUS logger ──────────────────────────────────────────
+function doPostModbus(data) {
+  var targetSheetName = data.sheet || "Daily_Log_Default";
+  var keys = data.keys || [];
+  var valuesObject = data.values || {};
+
+  var targetSpreadsheet = SpreadsheetApp.openById(SPREADSHEET_ID);
+
+  var totalCells = getTotalWorkbookCells(targetSpreadsheet);
+  if (totalCells >= 8000000) {
+    emailAndResetSpreadsheet(targetSpreadsheet, DEFAULTS.alert_email);
+  }
+
+  var sheet = targetSpreadsheet.getSheetByName(targetSheetName);
+  if (!sheet) {
+    sheet = targetSpreadsheet.insertSheet(targetSheetName);
+    var defaultSheet = targetSpreadsheet.getSheetByName("Sheet1");
+    if (defaultSheet && targetSpreadsheet.getSheets().length > 1) {
+      targetSpreadsheet.deleteSheet(defaultSheet);
+    }
+    if (keys.length > 0) sheet.appendRow(keys);
+    SpreadsheetApp.flush();
+  }
+
+  var rowData = [];
+  for (var i = 0; i < keys.length; i++) {
+    var val = valuesObject[keys[i]];
+    rowData.push((val === null || val === "None" || val === undefined) ? "" : val);
+  }
+  if (rowData.length > 0) sheet.appendRow(rowData);
+
+  try {
+    var cache = CacheService.getScriptCache();
+    var todayStr = Utilities.formatDate(new Date(), "Asia/Kolkata", "yyyy-MM-dd");
+    cache.remove("bundle_" + todayStr);
+  } catch(ex) {}
+
+  return ContentService.createTextOutput(JSON.stringify({
+    "status": "success",
+    "message": "Data logged into tab → " + targetSheetName
+  })).setMimeType(ContentService.MimeType.JSON);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
