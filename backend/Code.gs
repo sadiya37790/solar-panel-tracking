@@ -250,7 +250,7 @@ function routeBundle(params) {
 
   var cfg     = loadSettings();
   var ss      = SpreadsheetApp.openById(SPREADSHEET_ID);
-  var sheet   = ss.getSheetByName(dateStr);
+  var sheet   = findSheetByDate(ss, dateStr);
   var points  = [];
   var latest  = null;
   var energyReported = 0;
@@ -347,7 +347,11 @@ function routeDaily(params) {
 
   sheets.forEach(function(sh) {
     var name = sh.getName();
-    if (!name.startsWith(month)) return; // e.g. "2025-11-01" starts with "2025-11"
+    // Match tabs whose name ends with YYYY-MM-DD where the date starts with month
+    // e.g. "EEE Block-1 Solar Data_Slave_1_2026-11-13" ends with "2026-11-13"
+    var dateSuffix = name.match(/(\d{4}-\d{2}-\d{2})$/);
+    if (!dateSuffix) return;
+    if (!dateSuffix[1].startsWith(month)) return;
     var data  = readSheet(sh);
     var hdrs  = data.headers;
     var sRows = data.rows;
@@ -372,7 +376,7 @@ function routeDaily(params) {
     }
 
     if (peakKw > 0 || energyKwh > 0) {
-      rows.push({ date: name, energy_kwh: energyKwh, peak_kw: peakKw });
+      rows.push({ date: dateSuffix[1], energy_kwh: energyKwh, peak_kw: peakKw });
     }
   });
 
@@ -397,9 +401,11 @@ function routeMonths() {
 
   sheets.forEach(function(sh) {
     var name = sh.getName();
-    // Accept tabs named YYYY-MM-DD
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(name)) return;
-    var month = name.substring(0, 7); // "YYYY-MM"
+    // Accept tabs whose name ends with YYYY-MM-DD
+    // e.g. both "2026-11-13" and "EEE Block-1 Solar Data_Slave_1_2026-11-13"
+    var dateSuffix = name.match(/(\d{4}-\d{2}-\d{2})$/);
+    if (!dateSuffix) return;
+    var month = dateSuffix[1].substring(0, 7); // "YYYY-MM"
 
     var data   = readSheet(sh);
     var hdrs   = data.headers;
@@ -475,7 +481,8 @@ function setupDashboard() {
     alert_readings_in_a_row: "Consecutive low readings before alerting",
     alert_email:             "Email to notify on faults (leave blank to disable)",
     tariff_per_kwh:          "Electricity price in rupees per kWh",
-    co2_kg_per_kwh:          "kg CO2 avoided per kWh generated"
+    co2_kg_per_kwh:          "kg CO2 avoided per kWh generated",
+    ingest_key:              "Secret key for ESP32 firmware (must match INGEST_KEY in solar_logger.ino)"
   };
 
   // Header row
@@ -505,6 +512,26 @@ function setupDashboard() {
 // ═══════════════════════════════════════════════════════════════════════════
 // SECTION 4 — HELPER FUNCTIONS
 // ═══════════════════════════════════════════════════════════════════════════
+
+/**
+ * Find a sheet whose name exactly equals dateStr OR ends with "_" + dateStr.
+ * This handles both naming patterns:
+ *   "2026-11-13"                              (ESP32 firmware tabs)
+ *   "EEE Block-1 Solar Data_Slave_1_2026-11-13"  (existing MODBUS tabs)
+ */
+function findSheetByDate(ss, dateStr) {
+  var sheets = ss.getSheets();
+  // 1. Exact match first
+  for (var i = 0; i < sheets.length; i++) {
+    if (sheets[i].getName() === dateStr) return sheets[i];
+  }
+  // 2. Suffix match (name ends with the date)
+  for (var j = 0; j < sheets.length; j++) {
+    var n = sheets[j].getName();
+    if (n.endsWith(dateStr) || n.endsWith("_" + dateStr)) return sheets[j];
+  }
+  return null;
+}
 
 /**
  * Read a sheet and return {headers, rows} — both as string arrays.
